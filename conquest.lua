@@ -21,113 +21,157 @@
 
 addon.name      = 'conquest';
 addon.author    = 'AddonsXI';
-addon.version   = '1.0.0';
+addon.version   = '1.0.1';
 addon.link      = 'https://github.com/AddonsXI';
 addon.desc      = 'Shows which nations own which conquest regions.';
 
 require('common');
 local chat = require('chat');
 
--- Region ownership comes from packet 0x5E. Controller 1=San d'Oria, 2=Bastok, 3=Windurst, 4=Beastmen.
+-- Packet 0x5E: controller bytes start at 0x1D and increment by 4.
+local BASE_OFFSET = 0x1D;
+local OFFSET_STEP = 4;
+
 local REGIONS = T{
-    { offset = 0x1D, name = 'Ronfaure' },
-    { offset = 0x21, name = 'Zulkheim' },
-    { offset = 0x25, name = 'Norvallen' },
-    { offset = 0x29, name = 'Gustaberg' },
-    { offset = 0x2D, name = 'Derfland' },
-    { offset = 0x31, name = 'Sarutabaruta' },
-    { offset = 0x35, name = 'Kolshushu' },
-    { offset = 0x39, name = 'Aragoneu' },
-    { offset = 0x3D, name = 'Fauregandi' },
-    { offset = 0x41, name = 'Valdeaunia' },
-    { offset = 0x45, name = 'Qufim' },
-    { offset = 0x49, name = 'Li\'Telor' },
-    { offset = 0x4D, name = 'Kuzotz' },
-    { offset = 0x51, name = 'Vollbow' },
-    { offset = 0x55, name = 'Elshimo Lowlands' },
-    { offset = 0x59, name = 'Elshimo Uplands' },
-    { offset = 0x5D, name = 'Tu\'Lia' },
-    { offset = 0x61, name = 'Movalpolos' },
-    { offset = 0x65, name = 'Tavnazian Archipelago' },
+    'Ronfaure',
+    'Zulkheim',
+    'Norvallen',
+    'Gustaberg',
+    'Derfland',
+    'Sarutabaruta',
+    'Kolshushu',
+    'Aragoneu',
+    'Fauregandi',
+    'Valdeaunia',
+    'Qufim',
+    'Li\'Telor',
+    'Kuzotz',
+    'Vollbow',
+    'Elshimo Lowlands',
+    'Elshimo Uplands',
+    'Tu\'Lia',
+    'Movalpolos',
+    'Tavnazian Archipelago',
 };
 
--- FFXI chat colors from libs/chat.lua: 76=Tomato(red), 71=RoyalBlue, 69=Yellow, 79=Lime
+-- Chat colors from libs/chat.lua
 local CONTROLLERS = T{
-    [1] = { name = 'San d\'Oria', color = 76 },   -- red
-    [2] = { name = 'Bastok', color = 71 },       -- blue
-    [3] = { name = 'Windurst', color = 69 },     -- yellow
-    [4] = { name = 'Beastmen', color = 79 },     -- lime green
+    [1] = { name = 'San d\'Oria', color = 76 }, -- red
+    [2] = { name = 'Bastok',     color = 71 }, -- blue
+    [3] = { name = 'Windurst',   color = 69 }, -- yellow
+    [4] = { name = 'Beastmen',   color = 79 }, -- lime
 };
 
 local conquest = T{
-    regionControllers = {},
-    pendingDisplay = false,
+    regionControllers = T{},
+    awaitingPacket = false,
 };
 
--- Prints regions grouped by faction, sorted by count (most to least). One full line per nation.
-local function printRegions()
-    local byController = T{};
-    for _, region in ipairs(REGIONS) do
-        local ctrlId = conquest.regionControllers[region.name] or 0;
-        if not byController[ctrlId] then byController[ctrlId] = T{}; end
-        byController[ctrlId]:append(region.name);
-    end
-
-    local order = T{};
-    for ctrlId = 1, 4 do
-        local regions = byController[ctrlId];
-        if regions and #regions > 0 then
-            order:append({ ctrlId = ctrlId, count = #regions });
-        end
-    end
-    table.sort(order, function(a, b) return a.count > b.count; end);
-
-    for _, entry in ipairs(order) do
-        local ctrl = CONTROLLERS[entry.ctrlId];
-        local regions = byController[entry.ctrlId];
-        table.sort(regions);
-        local line = ctrl.name .. ' (' .. entry.count .. '): ' .. table.concat(regions, ', ');
-        print(chat.header(addon.name):append(chat.color1(ctrl.color, line)));
-    end
-
-    local unknown = byController[0];
-    if unknown and #unknown > 0 then
-        table.sort(unknown);
-        print(chat.header(addon.name):append(chat.message('Unknown: ' .. table.concat(unknown, ', '))));
-    end
-end
-
--- Sends packet 0x5A to request conquest data from the server.
+--[[
+* Sends packet 0x5A to request conquest data from the server.
+--]]
 local function requestConquest()
     local packet = struct.pack('L', 0);
     AshitaCore:GetPacketManager():AddOutgoingPacket(0x5A, packet:totable());
 end
 
-ashita.events.register('command', 'command_cb', function (e)
+--[[
+* Prints regions grouped by faction, sorted by count (most to least).
+--]]
+local function printRegions()
+    local buckets = T{};
+    for id = 1, 4 do
+        buckets[id] = T{ regions = T{}, count = 0 };
+    end
+
+    -- Controller 0 or unexpected values (no bucket for 1–4) fall into unknown.
+    local unknown = T{};
+
+    for i, regionName in ipairs(REGIONS) do
+        local ctrlId = conquest.regionControllers[i];
+        local bucket = buckets[ctrlId];
+
+        if bucket then
+            bucket.count = bucket.count + 1;
+            bucket.regions:append(regionName);
+        else
+            unknown:append(regionName);
+        end
+    end
+
+    local order = T{};
+    for id, bucket in pairs(buckets) do
+        if bucket.count > 0 then
+            table.sort(bucket.regions);
+            order:append(id);
+        end
+    end
+
+    table.sort(order, function(a, b)
+        return buckets[a].count > buckets[b].count;
+    end);
+
+    for _, id in ipairs(order) do
+        local ctrl = CONTROLLERS[id];
+        local bucket = buckets[id];
+
+        print(
+            chat.header(addon.name)
+                :append(chat.color1(
+                    ctrl.color,
+                    ('%s (%d): %s'):fmt(
+                        ctrl.name,
+                        bucket.count,
+                        table.concat(bucket.regions, ', ')
+                    )
+                ))
+        );
+    end
+
+    if #unknown > 0 then
+        table.sort(unknown);
+        print(
+            chat.header(addon.name)
+                :append(chat.message('Unknown: ' .. table.concat(unknown, ', ')))
+        );
+    end
+end
+
+--[[
+* event: command
+* desc : Event called when the addon is processing a command.
+--]]
+ashita.events.register('command', 'command_cb', function(e)
     local args = e.command:args();
-    if #args == 0 then return; end
+    if (#args == 0) then return; end
 
     local cmd = args[1]:lower();
-    if cmd ~= '/conquest' and cmd ~= '/regions' then return; end
+    if (cmd ~= '/conquest' and cmd ~= '/regions') then return; end
 
     e.blocked = true;
 
-    if next(conquest.regionControllers) then
+    if (next(conquest.regionControllers)) then
         printRegions();
     else
-        conquest.pendingDisplay = true;
+        conquest.awaitingPacket = true;
         requestConquest();
     end
 end);
 
-ashita.events.register('packet_in', 'conquest_packet_cb', function (e)
-    if e.id ~= 0x5E then return; end
-    if not conquest.pendingDisplay then return; end  -- only process when user requested data
+--[[
+* event: packet_in
+* desc : Event called when the addon is processing incoming packets.
+--]]
+ashita.events.register('packet_in', 'conquest_packet_cb', function(e)
+    if (e.id ~= 0x5E) then return; end
+    if (not conquest.awaitingPacket) then return; end
 
-    conquest.pendingDisplay = false;
-    for _, region in ipairs(REGIONS) do
-        local controller = struct.unpack('B', e.data, region.offset + 1);
-        conquest.regionControllers[region.name] = controller;
+    conquest.awaitingPacket = false;
+
+    for i = 1, #REGIONS do
+        local offset = BASE_OFFSET + (i - 1) * OFFSET_STEP;
+        conquest.regionControllers[i] = struct.unpack('B', e.data, offset + 1);
     end
+
     printRegions();
 end);
